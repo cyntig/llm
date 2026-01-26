@@ -26,13 +26,12 @@ table_schema = "llm"
 dataset_2_table = {"SuperStore": {"table": "tbl_super_store", "short": "SuperStore"}, 
                    "厦门工资拖欠2023年.xlsx": {"table": "tbl_salary_xm", "short": "SalaryXm"}
                     }
-
+sql_err_file = "../out/sql_err.jsonl"
 
 def get_table_structure(dataset):
     table_name = dataset_2_table[dataset]["table"]
     return pg_utils.get_schema(table_schema, table_name)
 
-    
 
 def get_table_structure_str(dataset):
     table_sturcture = get_table_structure(dataset)
@@ -55,9 +54,40 @@ def predict_sql(model, row, sys_prompt):
     print(f"{question}: {result}")
     return result
 
-def get_prompt_for_sql(dataset): 
-    table_structure = get_table_structure_str(dataset)
+
+# 
+def get_column_values(dataset, column_name, topN = 5):
     table_name = dataset_2_table[dataset]["table"]
+    query = f"""
+        SELECT "{column_name}"
+        FROM {table_schema}.{table_name}
+        GROUP BY "{column_name}"
+        ORDER BY COUNT(*) DESC
+        LIMIT {topN}
+    """
+    df = execute_sql(query, sql_err_file)
+    return [item[column_name] for item in df]
+def get_column_values_hints(dataset, column_names, topN = 5):
+    hints = []
+
+    for column_name in column_names:
+        values = [item for item in get_column_values(dataset, column_name, topN) if item is not None]
+        hint = f"{column_name}: {', '.join(values)}\n"
+        hints.append(hint)
+
+    return ''.join(hints)
+
+def get_column_values_hint(dataset, column_name, topN = 5):
+    values = get_column_values(dataset, column_name, topN)
+    return f"{column_name}: {', '.join(values)}"
+
+# 生成sql prompt
+def get_prompt_for_sql(dataset): 
+    table_structure = get_table_structure(dataset)
+    table_structure_hint = ', '.join([item['column_name'] + "-" + item['data_type'] for item in table_structure])
+    table_name = dataset_2_table[dataset]["table"]
+    column_names = [item['column_name'] for item in table_structure if item['data_type'] in ["text"]]
+    column_value_hints = get_column_values_hints(dataset, column_names, 5)
     prompt = f"""
         你是一名BI数据分析专家, 我这有表结构信息和用户问题，严格按照PostgreSQL语法规范生成SQL查询语句
 
@@ -76,7 +106,10 @@ def get_prompt_for_sql(dataset):
         表结构信息：
             - 数据库类型：PostgreSQL
             - 表名：{table_schema}.{table_name}
-            - 字段列表：名称-类型 \n {table_structure}
+            - 字段列表：名称-类型 \n {table_structure_hint}
+            - 值真实性：WHERE子句中的筛选值必须是表中真实存在的数据 
+              -- 参考值如下：
+              {column_value_hints}
 
 
         例如：
@@ -115,15 +148,17 @@ def sql_analysis(dataset, predictSModel, evaluationSModel, cp: Checkpoint = None
     for i, row in tqdm(ss_df.iterrows(), total=len(ss_df)):
         index = i + 1
         if index <= start_index:
-        # if row['问题'] != "封存时间为2023年6月份处理来源于小程序的案件有多少？":
+        # if row['问题'] != "事发时间为2022年，信件数量最少的月份是哪个月？":
             print(f"跳过 {index} - {row['问题']}")
             continue 
         else:
+            sys_prompt = get_prompt_for_sql(dataset)
+            # print(sys_prompt)
             sql = predict_sql(predictModel, row, get_prompt_for_sql(dataset))
             sql_ret = "很抱歉，无法查询到您提问的相关数据。"
             answer_ret = "很抱歉，无法查询到您提问的相关数据"
             if sql != "0": 
-                sql_ret = execute_sql(sql)
+                sql_ret = execute_sql(sql, sql_err_file)
                 print("2. 执行sql")
                 print(f"{sql}: {sql_ret}")
                 answer_ret = predict_answer(predictModel, row['问题'], sql_ret, get_prompt_for_answer())
@@ -185,15 +220,28 @@ def save_excel(results, dataset, model, version):
         with pandas.ExcelWriter(file_path, mode='a', if_sheet_exists='replace') as writer:
             df.to_excel(writer, sheet_name=model, index=False)
 
-def execute_sql(sql):
+def execute_sql(sql, sql_err_file):
     conn = pg_utils.create_connection()
-    return pg_utils.execute_sql(conn, sql)
+    return pg_utils.execute_sql(conn, sql, sql_err_file)
 
 def calculate_accuracy_rate(result): 
     total = len(result)
     correct = sum([1 if item['accuracy'] == '1' else 0 for item in result])
     accuracy_rate = correct / total
     print(f"Total: {total}, Correct: {correct}, Accuracy Rate: {accuracy_rate}")
+
+def version_diff(dataset, model, baseline, compare):
+    baseline_file = f"../out/{baseline}_{dataset_2_table[dataset]["short"]}.xlsx"
+    compare_file = f"../out/{compare}_{dataset_2_table[dataset]["short"]}.xlsx"
+        
+    baseline_df = pandas.read_excel(baseline_file, model)
+    compare_df = pandas.read_excel(compare_file, model)
+    diff_df = pandas.merge(baseline_df, compare_df, on=['uuid'], suffixes=('_baseline', '_compare'))
+    diff_df = diff_df[diff_df['accuracy_baseline'] != diff_df['accuracy_compare']]
+    print(diff_df[['uuid', '问题_baseline', 'accuracy_baseline', 'accuracy_compare']])
+    return diff_df
+
+
 
 if __name__ == "__main__":
     # dataset: SuperStore, 厦门工资拖欠2023年.xlsx
@@ -208,18 +256,20 @@ if __name__ == "__main__":
     dataset = sys.argv[1]
 
     print(f"使用模型: {usedModel}")  
-    version = "v2"
+    baseline = "v2"
+    version = "v5"
 
     
     checkpoint_dir = "../out/checkpoint/"
     file_name = f"cp_{version}_{usedModel}_{dataset_2_table[dataset]["short"]}.jsonl" 
     
-    ck_pt = Checkpoint(checkpoint_dir, file_name, STORAGE_LEVEL.DISK)
+    ck_pt = Checkpoint(checkpoint_dir, file_name, STORAGE_LEVEL.MEMORY)
     ck_pt.initialize()
 
     results = sql_analysis(dataset, usedModel, SMODEL_235B, ck_pt)
     calculate_accuracy_rate(results)
     save_excel(results, dataset, usedModel, version)
+    version_diff(dataset, usedModel,  baseline, version)
 
 
 
