@@ -92,16 +92,17 @@ def get_prompt_for_sql(dataset):
         你是一名BI数据分析专家, 我这有表结构信息和用户问题，严格按照PostgreSQL语法规范生成SQL查询语句
 
         分析步骤：
-        1. 理解llm.tbl_super_store（超市订单表）定义的内容
+        1. 理解llm.{table_name}表的定义和字段含义
         2. 请按照如下步骤理解和分析用户问题：
-            - 如果不相关，请直接回答"0"
-            - 如果相关，请严格按照PostgreSQL语法规范生成SQL查询语句
+            - 如果用户问题和该表内容不相关，请直接回答"不相关"
+            - 如果用户问题和该表内容相关，请严格按照PostgreSQL语法规范生成SQL查询语句
         
         输出要求：
             - 字段名匹配：生成的SQL语句中，所有字段名必须严格使用表结构信息中的中文字段名称
-            - 特殊字段名：如果字段名包含特殊字符（如-、空格），请使用双引号括起来
-            - 代码格式：只输出SQL代码，不要额外解释
+            - 特殊字段名：如果字段名包含特殊字符（如-、空格、中文等），请使用双引号括起来
+            - 代码格式：只输出SQL代码，不要额外解释或添加注释, 代码必须是合法的PostgreSQL代码
             - 代码优化：如果有筛选条件，尽量在WHERE子句中使用，而不是在FROM子句中使用子查询
+            - 单位转换：如果问题要求返回百分比值，只需返回分子与总数相除的原始比例（例如0.25），**不要在SQL中乘以100或添加百分号**
         
         表结构信息：
             - 数据库类型：PostgreSQL
@@ -139,16 +140,18 @@ def get_prompt_for_accuracy():
 ## 1. 预测sql查询语句
 ## 2. 执行sql语句
 ## 3. 生成标准文本
-def sql_analysis(dataset, predictSModel, evaluationSModel, cp: Checkpoint = None): 
+def sql_analysis(dataset, predictSModel, evaluationSModel, cp: Checkpoint = None, data_level: str = None): 
     evaluationModel = short_2_model[evaluationSModel]
     predictModel = short_2_model[predictSModel]
     df = pandas.read_excel('../data/v12_20250326.xlsx', 'Sheet1')
     ss_df = df[df['数据来源（表格名称）'] == dataset].reset_index(drop=True)
+    if data_level is not None:
+        ss_df = ss_df[ss_df['难度'] == data_level].reset_index(drop=True)
     start_index = cp.get_continuous_index()
     for i, row in tqdm(ss_df.iterrows(), total=len(ss_df)):
         index = i + 1
         if index <= start_index:
-        # if row['问题'] != "事发时间为2022年，信件数量最少的月份是哪个月？":
+        # if row['问题'] not in ("封存时间为2023年，11月份的事件数量与8月份的数量差多少？"):
             print(f"跳过 {index} - {row['问题']}")
             continue 
         else:
@@ -157,7 +160,7 @@ def sql_analysis(dataset, predictSModel, evaluationSModel, cp: Checkpoint = None
             sql = predict_sql(predictModel, row, get_prompt_for_sql(dataset))
             sql_ret = "很抱歉，无法查询到您提问的相关数据。"
             answer_ret = "很抱歉，无法查询到您提问的相关数据"
-            if sql != "0": 
+            if sql != "不相关": 
                 sql_ret = execute_sql(sql, sql_err_file)
                 print("2. 执行sql")
                 print(f"{sql}: {sql_ret}")
@@ -228,7 +231,31 @@ def calculate_accuracy_rate(result):
     total = len(result)
     correct = sum([1 if item['accuracy'] == '1' else 0 for item in result])
     accuracy_rate = correct / total
+
+    easy_correct = sum([1 if item['难度'] == '简单' and item['accuracy'] == '1' else 0 for item in result])
+    easy_total = sum([1 if item['难度'] == '简单' else 0 for item in result])
+    easy_accuracy_rate = easy_correct / easy_total if easy_total > 0 else 0
+
+    medium_correct = sum([1 if item['难度'] == '中等' and item['accuracy'] == '1'  else 0 for item in result])
+    medium_total = sum([1 if item['难度'] == '中等' else 0 for item in result])
+    medium_accuracy_rate = medium_correct / medium_total if medium_total > 0 else 0
+
+    hard_correct = sum([1 if item['难度'] == '难' and item['accuracy'] == '1' else 0 for item in result])
+    hard_total = sum([1 if item['难度'] == '难' else 0 for item in result])
+    hard_accuracy_rate = hard_correct / hard_total if hard_total > 0 else 0
+
+    very_hard_correct = sum([1 if item['难度'] == '非常难' and item['accuracy'] == '1' else 0 for item in result])
+    very_hard_total = sum([1 if item['难度'] == '非常难' else 0 for item in result])
+    very_hard_accuracy_rate = very_hard_correct / very_hard_total if very_hard_total > 0 else 0
+
+
+
     print(f"Total: {total}, Correct: {correct}, Accuracy Rate: {accuracy_rate}")
+    print(f"Easy Total: {easy_total}, Easy Correct: {easy_correct}, Easy Accuracy Rate: {easy_accuracy_rate}")
+    print(f"Medium Total: {medium_total}, Medium Correct: {medium_correct}, Medium Accuracy Rate: {medium_accuracy_rate}")
+    print(f"Hard Total: {hard_total}, Hard Correct: {hard_correct}, Hard Accuracy Rate: {hard_accuracy_rate}")
+    print(f"Very Hard Total: {very_hard_total}, Very Hard Correct: {very_hard_correct}, Very Hard Accuracy Rate: {very_hard_accuracy_rate}")
+
 
 def version_diff(dataset, model, baseline, compare):
     baseline_file = f"../out/{baseline}_{dataset_2_table[dataset]["short"]}.xlsx"
@@ -256,15 +283,16 @@ if __name__ == "__main__":
     dataset = sys.argv[1]
 
     print(f"使用模型: {usedModel}")  
-    baseline = "v2"
-    version = "v5"
+    baseline = "v3"
+    version = "v4"
 
     
     checkpoint_dir = "../out/checkpoint/"
     file_name = f"cp_{version}_{usedModel}_{dataset_2_table[dataset]["short"]}.jsonl" 
     
-    ck_pt = Checkpoint(checkpoint_dir, file_name, STORAGE_LEVEL.MEMORY)
+    ck_pt = Checkpoint(checkpoint_dir, file_name, STORAGE_LEVEL.DISK)
     ck_pt.initialize()
+    data_level = "中等"
 
     results = sql_analysis(dataset, usedModel, SMODEL_235B, ck_pt)
     calculate_accuracy_rate(results)
